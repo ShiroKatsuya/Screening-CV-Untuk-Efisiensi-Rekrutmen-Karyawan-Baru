@@ -29,7 +29,9 @@ class CandidateUploadRequest extends FormRequest
             'skills' => ['nullable', 'string'],
             'years_experience' => ['nullable', 'integer', 'min:0', 'max:60'],
             'education_level' => ['nullable', 'string', 'max:255'],
-            'cv_file' => ['required', 'file', 'mimes:pdf,doc,docx', 'max:5120'],
+            'cv_file' => ['required', 'file', 'mimes:pdf,doc,docx', 'max:5120', 'min:1'],
         ];
     }
+
+
 }

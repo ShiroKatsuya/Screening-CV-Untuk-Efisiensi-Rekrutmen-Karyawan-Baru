@@ -2,9 +2,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any
+import re
 
-import numpy as np
-from sklearn.ensemble import RandomForestRegressor
+import numpy as np  # Optional; kept if needed elsewhere
 
 import spacy
 from spacy.util import is_package, get_package_path
@@ -66,26 +66,52 @@ def get_nlp():
 
 def extract_features(payload: CandidatePayload) -> Dict[str, Any]:
     nlp = get_nlp()
-    doc = nlp((payload.cv_text or "")[:20000])
+    # Combine cv_text and skills for richer signal
+    combined_text = ((payload.cv_text or "") + "\n" + (payload.skills or "")).strip()
+    doc = nlp(combined_text[:20000])
 
     tokens = [t.lemma_.lower() for t in doc if not t.is_stop and t.is_alpha]
     text = " ".join(tokens)
 
-    keywords = {
-        "python": text.count("python"),
-        "javascript": text.count("javascript") + text.count("node"),
-        "sql": text.count("sql") + text.count("mysql") + text.count("postgres"),
-        "nlp": text.count("nlp") + text.count("spacy") + text.count("transformer"),
-        "ml": text.count("sklearn") + text.count("pytorch") + text.count("tensorflow") + text.count("machine learning"),
+    # Keyword counts with simple stemming/aliases
+    keyword_defs = {
+        "python": ["python"],
+        "javascript": ["javascript", "node", "nodejs", "react", "vue"],
+        "sql": ["sql", "mysql", "postgres", "postgresql", "mssql", "oracle"],
+        "nlp": ["nlp", "spacy", "transformer", "bert", "huggingface"],
+        "ml": ["sklearn", "scikit", "pytorch", "tensorflow", "machine", "ml"],
     }
 
+    keywords = {}
+    for k, aliases in keyword_defs.items():
+        keywords[k] = sum(text.count(a) for a in aliases)
+
+    # Infer years of experience from text as a fallback/boost
     years = payload.years_experience or 0
-    edu_map = {"sma": 0, "diploma": 1, "sarjana": 2, "magister": 3, "doktor": 4}
+    inferred_years = 0
+    years_patterns = [
+        r"(\d{1,2})\s*\+?\s*(years|year|yrs|yr|tahun)",
+        r"experience\s*(?:of|:)?\s*(\d{1,2})",
+    ]
+    for pat in years_patterns:
+        matches = re.findall(pat, combined_text.lower())
+        for m in matches:
+            try:
+                # m can be tuple or str depending on pattern
+                val = int(m[0] if isinstance(m, tuple) else m)
+                inferred_years = max(inferred_years, val)
+            except Exception:
+                continue
+    years = max(years, inferred_years)
+
+    # Education score mapping (Indonesian terms included)
+    edu_map = {"sma": 0, "diploma": 1, "sarjana": 2, "s1": 2, "magister": 3, "s2": 3, "doktor": 4, "s3": 4, "phd": 4, "bachelor": 2, "master": 3, "doctor": 4}
     edu = (payload.education_level or "").strip().lower()
     edu_score = edu_map.get(edu, 1 if edu else 0)
 
+    # Position match: count of relevant tokens in position title
     pos = (payload.position_applied or "").lower()
-    pos_keywords = sum(1 for k in ["data", "engineer", "analyst", "developer", "nlp"] if k in pos)
+    pos_keywords = sum(1 for k in ["data", "engineer", "analyst", "developer", "nlp", "scientist", "ml"] if k in pos)
 
     features = {
         **keywords,
@@ -97,43 +123,50 @@ def extract_features(payload: CandidatePayload) -> Dict[str, Any]:
     return features
 
 def score_features(features: Dict[str, Any]) -> float:
-    # Build a tiny synthetic model per request (for demo). In production, load a persisted model.
-    X = []
-    y = []
-    rng = np.random.default_rng(42)
-    for i in range(100):
-        f = {
-            "python": rng.integers(0, 20),
-            "javascript": rng.integers(0, 20),
-            "sql": rng.integers(0, 20),
-            "nlp": rng.integers(0, 20),
-            "ml": rng.integers(0, 20),
-            "years_experience": rng.integers(0, 15),
-            "education_score": rng.integers(0, 4),
-            "position_match": rng.integers(0, 3),
-            "tokens_len": rng.integers(50, 1000),
-        }
-        X.append(list(f.values()))
-        # Synthetic score roughly correlated with features
-        y.append(
-            0.4 * f["python"] +
-            0.3 * f["ml"] +
-            0.2 * f["nlp"] +
-            2.0 * f["years_experience"] +
-            3.0 * f["education_score"] +
-            1.0 * f["position_match"] +
-            0.01 * f["tokens_len"] +
-            rng.normal(0, 2)
-        )
+    # Deterministic weighted scoring with normalization and caps
+    caps = {
+        "python": 30,
+        "javascript": 30,
+        "sql": 30,
+        "nlp": 20,
+        "ml": 30,
+        "years_experience": 15,
+        "education_score": 4,
+        "position_match": 3,
+        "tokens_len": 2000,
+    }
 
-    model = RandomForestRegressor(n_estimators=50, random_state=42)
-    model.fit(np.array(X), np.array(y))
+    weights = {
+        "python": 12.0,
+        "javascript": 8.0,
+        "sql": 10.0,
+        "nlp": 10.0,
+        "ml": 12.0,
+        "years_experience": 20.0,
+        "education_score": 12.0,
+        "position_match": 10.0,
+        "tokens_len": 6.0,
+    }
 
-    x = np.array([list(features.values())]).astype(float)
-    pred = float(model.predict(x)[0])
-    # Normalize to 0-100 range (heuristic)
-    score = max(0.0, min(100.0, pred))
-    return score
+    # Ensure weights sum to 100 (tolerance)
+    total_weight = sum(weights.values())
+    if abs(total_weight - 100.0) > 1e-6:
+        # Normalize weights to sum to 100
+        weights = {k: v * (100.0 / total_weight) for k, v in weights.items()}
+
+    score = 0.0
+    for name, cap in caps.items():
+        value = float(features.get(name, 0))
+        # Soft cap using min; tokens_len uses log compression
+        if name == "tokens_len":
+            norm = min(1.0, (np.log1p(value) / np.log1p(cap)))
+        else:
+            norm = max(0.0, min(1.0, value / cap))
+        score += weights.get(name, 0.0) * norm
+
+    # Final clamp
+    score = max(0.0, min(100.0, score))
+    return float(score)
 
 @app.get("/")
 def root():
